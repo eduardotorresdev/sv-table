@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Release increment
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: sv-table-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "Release workflow only runs from main."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: yarn
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright browser
+        run: yarn playwright install --with-deps chromium
+
+      - name: Run lint
+        run: yarn lint
+
+      - name: Run svelte-check
+        run: yarn run check
+
+      - name: Run build
+        run: yarn build
+
+      - name: Run tests
+        run: yarn test
+
+      - name: Bump version
+        id: version
+        env:
+          RELEASE_TYPE: ${{ github.event.inputs.release_type }}
+        run: |
+          CURRENT_VERSION="$(node -p "require('./package.json').version")"
+          NEXT_VERSION="$(node -e "const [major, minor, patch] = process.argv[1].split('.').map(Number); const type = process.argv[2]; const next = type === 'major' ? [major + 1, 0, 0] : type === 'minor' ? [major, minor + 1, 0] : [major, minor, patch + 1]; process.stdout.write(next.join('.'));" "$CURRENT_VERSION" "$RELEASE_TYPE")"
+          node -e "const fs = require('fs'); const file = 'package.json'; const pkg = JSON.parse(fs.readFileSync(file, 'utf8')); pkg.version = process.argv[1]; fs.writeFileSync(file, JSON.stringify(pkg, null, '\t') + '\n');" "$NEXT_VERSION"
+          echo "current_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh lockfile
+        run: yarn install
+
+      - name: Commit release version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json yarn.lock
+          git commit -m "chore(release): v${VERSION}"
+          git push origin HEAD:main
+
+      - name: Create Git tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: Create GitHub prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" \
+            --verify-tag \
+            --prerelease \
+            --title "v${VERSION}" \
+            --notes "Release v${VERSION}."
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+
+      - name: Promote GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release edit "v${VERSION}" --prerelease=false
